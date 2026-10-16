@@ -1,0 +1,426 @@
+import html
+import json
+import os
+from datetime import date, datetime, timedelta
+
+import telebot
+from telebot import types
+
+# ====================== НАСТРОЙКИ (меняй под клиента) ======================
+TOKEN = "8857662197:AAEI7wF7lp-ThAvh4Z4KVAamNFchggygYHc"
+ADMIN_ID = 7897908344  # твой ID из /myid, без кавычек
+
+SHOP_NAME = "Стригу и брею"
+ADDRESS = "ул. Мира, 84"
+HOURS = "Ежедневно 09:00–20:00"
+PHONE = "89230455701"
+
+# Услуги, разбитые по категориям (с короткими ID для безопасности кнопок)
+SERVICE_CATEGORIES = {
+    "head": {
+        "name": "💇‍♂️ Голова",
+        "items": {
+            "h1": ("Мужская / детская стрижка", 800),
+            "h2": ("Мужская / детская стрижка + фейд", 1000),
+            "h3": ("Неполная стрижка бока", 700),
+            "h4": ("Окантовка", 400),
+            "h5": ("2 насадки + окантовка", 600),
+            "h6": ("1 насадка + окантовка", 500),
+            "h7": ("Наголо (машинка / триммер)", 400),
+            "h8": ("Наголо (шейвер)", 600),
+            "h9": ("Наголо (шаветка)", 800),
+            "h10": ("Тонировка седины", "от 800"),
+            "h11": ("Завивка волос", "от 2500"),
+        }
+    },
+    "beard": {
+        "name": "🧔 Борода",
+        "items": {
+            "b1": ("Оформление бороды", "от 600"),
+            "b2": ("Окантовка бороды", 400),
+            "b3": ("Сбрить / 1 насадка", 400),
+            "b4": ("Тонировка седины (борода)", "от 800"),
+        }
+    },
+    "extra": {
+        "name": "✨ Дополнительно",
+        "items": {
+            "e1": ("Оформление бровей", 300),
+            "e2": ("Ваксинг 1 зона", 200),
+            "e3": ("Помыть / укладка", 200),
+            "e4": ("Уход за лицом (глина / скраб)", 300),
+            "e5": ("Hair tattoo", 100),
+        }
+    }
+}
+
+# Общий словарь всех услуг для быстрого доступа к ценам
+SERVICES = {}
+for cat_key, cat_data in SERVICE_CATEGORIES.items():
+    for s_key, (s_name, s_price) in cat_data["items"].items():
+        SERVICES[s_name] = s_price
+
+MASTERS = ["Юлия"]
+ANY_MASTER = "Юлия"
+
+# Генерация временных слотов с 9:00 до 20:00 с шагом в 30 минут
+TIMES = []
+start_hour, start_min = 9, 0
+end_hour = 20
+while start_hour < end_hour:
+    TIMES.append(f"{start_hour:02d}:{start_min:02d}")
+    start_min += 30
+    if start_min >= 60:
+        start_min = 0
+        start_hour += 1
+
+DAYS_AHEAD = 7
+FILE = "bookings.json"
+# ===========================================================================
+
+WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+BTN_BOOK = "✂️ Записаться"
+BTN_MY = "📋 Мои записи"
+BTN_PRICES = "💰 Услуги и цены"
+BTN_CONTACTS = "📍 Контакты"
+BTN_CANCEL = "❌ Отмена"
+
+bot = telebot.TeleBot(TOKEN)
+temp = {}  # что клиент выбирает прямо сейчас
+
+
+# ---------- хранение записей ----------
+def load_records():
+    if os.path.exists(FILE):
+        with open(FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+
+def save_records(records):
+    with open(FILE, "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+
+
+def slot_dt(r):
+    return datetime.strptime(f"{r['day']} {r['time']}", "%Y-%m-%d %H:%M")
+
+
+# ---------- логика свободных окон ----------
+def get_days():
+    return [(date.today() + timedelta(days=i)).isoformat() for i in range(DAYS_AHEAD)]
+
+
+def pretty_day(iso):
+    d = date.fromisoformat(iso)
+    return f"{WEEKDAYS[d.weekday()]} {d.strftime('%d.%m')}"
+
+
+def is_taken(master, day, time):
+    return any(r["master"] == master and r["day"] == day and r["time"] == time
+               for r in load_records())
+
+
+def free_masters(master_choice, day, time):
+    candidates = MASTERS if master_choice == ANY_MASTER else [master_choice]
+    return [m for m in candidates if not is_taken(m, day, time)]
+
+
+def free_times(master_choice, day):
+    now = datetime.now()
+    result = []
+    for t in TIMES:
+        if datetime.strptime(f"{day} {t}", "%Y-%m-%d %H:%M") <= now:
+            continue
+        if free_masters(master_choice, day, t):
+            result.append(t)
+    return result
+
+
+# ---------- оформление ----------
+def main_menu():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(BTN_BOOK)
+    kb.add(BTN_MY, BTN_PRICES)
+    kb.add(BTN_CONTACTS)
+    return kb
+
+
+def kb_buttons(pairs, prefix, row=1, back=None):
+    kb = types.InlineKeyboardMarkup(row_width=row)
+    buttons = [types.InlineKeyboardButton(label, callback_data=f"{prefix}|{value}")
+               for label, value in pairs]
+    if buttons:
+        kb.add(*buttons)
+    if back:
+        kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=back))
+    return kb
+
+
+def show(chat_id, message_id, text, kb=None):
+    """Обновляет старое сообщение, а если нельзя, шлёт новое."""
+    if message_id:
+        try:
+            bot.edit_message_text(text, chat_id, message_id, reply_markup=kb, parse_mode="HTML")
+            return
+        except Exception as e:
+            if "not modified" in str(e):
+                return
+    bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+
+
+def record_text(r):
+    price = r.get("price") or SERVICES.get(r["service"], "")
+    return (f"✂️ {r['service']} — {price} ₽\n"
+            f"💈 Мастер: {r['master']}\n"
+            f"📅 {pretty_day(r['day'])}, {r['time']}")
+
+
+def notify_admin(text):
+    if not ADMIN_ID:
+        return
+    try:
+        bot.send_message(ADMIN_ID, text, parse_mode="HTML")
+    except Exception as e:
+        print("Не удалось отправить админу:", e)
+
+
+# ---------- шаги записи ----------
+def step_category(chat_id, mid):
+    kb = kb_buttons([(cat_data["name"], cat_key) for cat_key, cat_data in SERVICE_CATEGORIES.items()], "cat", row=1)
+    show(chat_id, mid, "📁 <b>Выберите категорию услуг:</b>", kb)
+
+
+def step_service(chat_id, mid, cat_key):
+    cat_data = SERVICE_CATEGORIES[cat_key]
+    items = cat_data["items"]
+    kb = kb_buttons([(f"{name} — {price} ₽", s_key) for s_key, (name, price) in items.items()], "service", row=1, back="back|cat")
+    show(chat_id, mid, f"✂️ <b>Категория: {cat_data['name']}</b>\nВыберите услугу:", kb)
+
+
+def step_day(chat_id, mid):
+    data = temp[chat_id]
+    data["master"] = MASTERS[0]
+    days = [d for d in get_days() if free_times(data["master"], d)]
+    if not days:
+        kb = kb_buttons([], "x", back="back|service_back")
+        show(chat_id, mid, f"😔 Свободных окон пока нет. Позвоните нам: {PHONE}", kb)
+        return
+    kb = kb_buttons([(pretty_day(d), d) for d in days], "day", row=2, back="back|service_back")
+    show(chat_id, mid, "📅 <b>Выберите день:</b>", kb)
+
+
+def step_time(chat_id, mid):
+    data = temp[chat_id]
+    times = free_times(data["master"], data["day"])
+    if not times:
+        step_day(chat_id, mid)
+        return
+    kb = kb_buttons([(t, t) for t in times], "time", row=3, back="back|day")
+    show(chat_id, mid, f"🕐 <b>Выберите время</b>\n📅 {pretty_day(data['day'])}", kb)
+
+
+def step_contact(chat_id, mid):
+    data = temp[chat_id]
+    data["awaiting_contact"] = True
+    show(chat_id, mid, "Вы выбрали:\n\n" + record_text(data), None)
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    kb.add(types.KeyboardButton("📱 Отправить мой номер", request_contact=True))
+    kb.add(BTN_CANCEL)
+    bot.send_message(chat_id, "📝 <b>Почти готово!</b>\nНажмите кнопку ниже, чтобы отправить номер телефона 👇",
+                     reply_markup=kb, parse_mode="HTML")
+
+
+def finish_booking(message, phone):
+    chat_id = message.chat.id
+    data = temp.pop(chat_id, None)
+    if not data:
+        return
+    masters = free_masters(data["master"], data["day"], data["time"])
+    if not masters:
+        bot.send_message(chat_id, "😔 Это время только что заняли. Нажмите «Записаться» и выберите другое.",
+                         reply_markup=main_menu())
+        return
+
+    records = load_records()
+    user = message.from_user
+    record = {
+        "id": max([r["id"] for r in records], default=0) + 1,
+        "user_id": chat_id,
+        "name": user.first_name or "",
+        "username": user.username,
+        "phone": phone,
+        "service": data["service"],
+        "price": SERVICES[data["service"]],
+        "master": masters[0],
+        "day": data["day"],
+        "time": data["time"],
+    }
+    records.append(record)
+    save_records(records)
+
+    bot.send_message(chat_id,
+                     "✅ <b>Вы записаны!</b>\n\n" + record_text(record) +
+                     f"\n\n📍 {ADDRESS}\n\nЕсли планы изменятся, отмените запись в разделе «{BTN_MY}».",
+                     reply_markup=main_menu(), parse_mode="HTML")
+
+    uname = f" (@{html.escape(user.username)})" if user.username else ""
+    notify_admin(f"🔔 <b>Новая запись #{record['id']}</b>\n\n" + record_text(record) +
+                 f"\n👤 {html.escape(record['name'])}{uname}\n📞 {html.escape(str(phone))}")
+
+
+# ---------- команды ----------
+@bot.message_handler(commands=['start'])
+def start(message):
+    temp.pop(message.chat.id, None)
+    name = html.escape(message.from_user.first_name or "друг")
+    bot.send_message(message.chat.id,
+                     f"Привет, {name}! 👋\nДобро пожаловать в <b>{SHOP_NAME}</b> 💈\n\n"
+                     "Записывайтесь онлайн за минуту: без звонков и ожидания.",
+                     reply_markup=main_menu(), parse_mode="HTML")
+
+
+@bot.message_handler(commands=['myid'])
+def my_id(message):
+    bot.send_message(message.chat.id, f"Твой ID: {message.chat.id}")
+
+
+@bot.message_handler(commands=['records'])
+def show_records(message):
+    if not ADMIN_ID or message.chat.id != ADMIN_ID:
+        return
+    upcoming = sorted([r for r in load_records() if slot_dt(r) > datetime.now()], key=slot_dt)
+    if not upcoming:
+        bot.send_message(message.chat.id, "Предстоящих записей нет.")
+        return
+    lines = [f"#{r['id']} · {pretty_day(r['day'])} {r['time']} · {r['master']}\n"
+             f"{r['service']} · {html.escape(r['name'])} · {html.escape(str(r['phone']))}"
+             for r in upcoming]
+    bot.send_message(message.chat.id, "📋 <b>Предстоящие записи</b>\n\n" + "\n\n".join(lines),
+                     parse_mode="HTML")
+
+
+# ---------- получение номера телефона ----------
+@bot.message_handler(content_types=['contact'])
+def on_contact(message):
+    data = temp.get(message.chat.id)
+    if data and data.get("awaiting_contact"):
+        finish_booking(message, message.contact.phone_number)
+
+
+def waiting_contact(m):
+    return temp.get(m.chat.id, {}).get("awaiting_contact") is True
+
+
+@bot.message_handler(func=waiting_contact)
+def text_contact(message):
+    text = message.text.strip()
+    if text == BTN_CANCEL:
+        temp.pop(message.chat.id, None)
+        bot.send_message(message.chat.id, "Запись отменена. Возвращайтесь, когда будете готовы 🙂",
+                         reply_markup=main_menu())
+        return
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) < 9:
+        bot.send_message(message.chat.id,
+                         "Не похоже на номер 🤔 Нажмите кнопку «Отправить мой номер» или напишите номер цифрами.")
+        return
+    finish_booking(message, text)
+
+
+# ---------- меню ----------
+@bot.message_handler(func=lambda m: m.text == BTN_BOOK)
+def book(message):
+    temp[message.chat.id] = {}
+    step_category(message.chat.id, None)
+
+
+@bot.message_handler(func=lambda m: m.text == BTN_MY)
+def my_bookings(message):
+    mine = [r for r in load_records()
+            if r["user_id"] == message.chat.id and slot_dt(r) > datetime.now()]
+    if not mine:
+        bot.send_message(message.chat.id, "У вас пока нет предстоящих записей.", reply_markup=main_menu())
+        return
+    for r in mine:
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("❌ Отменить запись", callback_data=f"cancel|{r['id']}"))
+        bot.send_message(message.chat.id, "📋 <b>Ваша запись</b>\n\n" + record_text(r),
+                         reply_markup=kb, parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.text == BTN_PRICES)
+def prices(message):
+    text = ["💰 <b>Услуги и цены</b>\n"]
+    for cat_key, cat_data in SERVICE_CATEGORIES.items():
+        text.append(f"<b>{cat_data['name']}</b>")
+        for s_key, (n, p) in cat_data["items"].items():
+            text.append(f"• {n} — <b>{p} ₽</b>")
+        text.append("")
+    bot.send_message(message.chat.id, "\n".join(text), reply_markup=main_menu(), parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: m.text == BTN_CONTACTS)
+def contacts(message):
+    bot.send_message(message.chat.id,
+                     f"📍 <b>{SHOP_NAME}</b>\n\nАдрес: {ADDRESS}\nЧасы работы: {HOURS}\nТелефон: {PHONE}",
+                     reply_markup=main_menu(), parse_mode="HTML")
+
+
+# ---------- нажатия на inline-кнопки ----------
+@bot.callback_query_handler(func=lambda c: True)
+def on_click(call):
+    chat_id = call.message.chat.id
+    mid = call.message.message_id
+    kind, value = call.data.split("|", 1)
+    bot.answer_callback_query(call.id)
+
+    if kind == "cancel":
+        records = load_records()
+        rec = next((r for r in records if str(r["id"]) == value and r["user_id"] == chat_id), None)
+        if not rec:
+            show(chat_id, mid, "Эта запись уже отменена.", None)
+            return
+        records.remove(rec)
+        save_records(records)
+        show(chat_id, mid, "❌ <b>Запись отменена</b>\n\n" + record_text(rec), None)
+        notify_admin(f"❌ <b>Отмена записи #{rec['id']}</b>\n\n" + record_text(rec) +
+                     f"\n👤 {html.escape(rec['name'])}")
+        return
+
+    data = temp.get(chat_id)
+    if data is None:
+        show(chat_id, mid, f"⏳ Эта запись устарела. Нажмите «{BTN_BOOK}», чтобы начать заново.", None)
+        return
+
+    if kind == "cat":
+        data["category"] = value
+        step_service(chat_id, mid, value)
+    elif kind == "service":
+        # Находим реальное название услуги по её короткому ключу
+        cat_key = data.get("category", "head")
+        service_name, _ = SERVICE_CATEGORIES[cat_key]["items"][value]
+        data["service"] = service_name
+        step_day(chat_id, mid)
+    elif kind == "day":
+        data["day"] = value
+        step_time(chat_id, mid)
+    elif kind == "time":
+        data["time"] = value
+        step_contact(chat_id, mid)
+    elif kind == "back":
+        if value == "cat":
+            step_category(chat_id, mid)
+        elif value == "service_back":
+            step_service(chat_id, mid, data.get("category", "head"))
+        elif value == "day":
+            step_day(chat_id, mid)
+
+
+@bot.message_handler(func=lambda m: True)
+def fallback(message):
+    bot.send_message(message.chat.id, "Не понял 🤷 Выберите кнопку внизу.", reply_markup=main_menu())
+
+
+bot.delete_webhook()
+bot.infinity_polling()
